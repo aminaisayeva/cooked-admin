@@ -6,9 +6,10 @@
 alter table public.profiles
   add column is_superadmin boolean not null default false;
 
--- Users may update their own profile row (names, avatar). They must never be
--- able to promote themselves, so the flag can only change outside the API
--- (the SQL editor / a migration, running as postgres).
+-- Users may update their own profile row, but only first_name, last_name and
+-- avatar_path are granted, so the API already refuses is_superadmin. This
+-- trigger is a second lock in case a broader grant is ever added: the flag
+-- only changes outside the API (the SQL editor / a migration, as postgres).
 create function public.profiles_lock_superadmin()
 returns trigger
 language plpgsql
