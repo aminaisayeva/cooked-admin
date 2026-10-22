@@ -1,5 +1,7 @@
 # cooked.ai admin
 
+**Live:** https://cooked-admin-inky.vercel.app (superadmins only)
+
 The admin area for [cooked.ai](https://github.com/aminaisayeva/will-you-give-me-an-a): stats, users, AI-generated media and votes, read straight from the same Supabase database.
 
 ## Pages
