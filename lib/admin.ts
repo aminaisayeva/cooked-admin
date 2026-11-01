@@ -92,12 +92,7 @@ export function fullName(p: Pick<Profile, "first_name" | "last_name"> | null | u
   return [p?.first_name, p?.last_name].filter(Boolean).join(" ");
 }
 
-export const STYLE_EMOJI: Record<string, string> = {
-  "Chronically Online": "\u{1F480}",
-  "Midwest Mom": "\u{1F33D}",
-  "Real New Yorker": "\u{1F5FD}",
-  "Columbia Tour Guide": "\u{1F981}",
-};
+export { STYLE_EMOJI } from "@/lib/voices";
 
 const dateTime = new Intl.DateTimeFormat("en-US", { timeZone: TIME_ZONE, dateStyle: "medium", timeStyle: "short" });
 const dateOnly = new Intl.DateTimeFormat("en-US", { timeZone: TIME_ZONE, dateStyle: "medium" });

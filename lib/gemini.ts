@@ -1,5 +1,6 @@
-// Server-only: Google Gemini captions, the same prompt and voices as the cooked.ai app.
+// Server-only: Google Gemini calls, the same as the cooked.ai app (lib/gemini.ts there).
 
+// The user message sent with each request (shown in the app's "See the prompt").
 export function captionUserMessage(context: string | null) {
   return context ? `Uploader's context: "${context}"` : "No context from the uploader.";
 }
@@ -19,14 +20,36 @@ function thinkingConfig(model: string) {
   return { thinkingLevel: "minimal" };
 }
 
-export class GeminiError extends Error {}
+export class GeminiError extends Error {
+  constructor(
+    message: string,
+    readonly status?: number,
+  ) {
+    super(message);
+  }
+}
 
 // Overloaded (503), rate limited (429) or a server hiccup: worth another try.
 class RetryableError extends GeminiError {}
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-type Part = { text: string } | { inlineData: { mimeType: string; data: string } };
+export type Part = { text: string } | { inlineData: { mimeType: string; data: string } };
+
+// A model to try: the API id, plus settings from the llm_models table.
+export type ModelChoice = { apiModelId: string; id?: string | null; temperature?: number; maxOutputTokens?: number };
+
+// One call to one model, successful or not, for the llm_responses log.
+export type Attempt = {
+  model: ModelChoice;
+  ok: boolean;
+  text: string | null;
+  httpStatus: number | null;
+  error: string | null;
+  promptTokens: number | null;
+  outputTokens: number | null;
+  durationMs: number;
+};
 
 type JsonCall = {
   systemPrompt: string;
@@ -35,21 +58,40 @@ type JsonCall = {
   maxOutputTokens: number;
   timeoutMs: number;
   temperature?: number;
+  // Defaults to GEMINI_MODEL and the fallbacks.
+  models?: ModelChoice[];
+  onAttempt?: (attempt: Attempt) => void | Promise<void>;
 };
 
 // Ask Gemini for JSON matching `schema`. Retries overloaded models, then falls
 // back to the next model. Returns the parsed object and the model that answered.
-async function callJson<T>(call: JsonCall): Promise<{ data: Partial<T>; model: string }> {
+export async function callJson<T>(call: JsonCall): Promise<{ data: Partial<T>; model: string; choice: ModelChoice }> {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) throw new GeminiError("The AI isn't configured yet (missing GEMINI_API_KEY).");
 
-  const models = [...new Set([geminiModel(), ...FALLBACK_MODELS])];
+  const models = call.models?.length
+    ? call.models
+    : [...new Set([geminiModel(), ...FALLBACK_MODELS])].map((apiModelId) => ({ apiModelId }));
   let lastError: GeminiError = new GeminiError("The AI is busy right now. Try again in a minute.");
-  for (const model of models) {
+  for (const choice of models) {
     for (let attempt = 0; attempt < 2; attempt++) {
+      const started = Date.now();
       try {
-        return { data: await callModel<T>(model, apiKey, call), model };
+        const result = await callModel<T>(choice, apiKey, call);
+        await call.onAttempt?.({ model: choice, ok: true, text: result.text, httpStatus: 200, error: null, ...result.usage, durationMs: Date.now() - started });
+        return { data: result.data, model: choice.apiModelId, choice };
       } catch (err) {
+        const e = err instanceof GeminiError ? err : new GeminiError("Unexpected error.");
+        await call.onAttempt?.({
+          model: choice,
+          ok: false,
+          text: e instanceof ResponseError ? e.text : null,
+          httpStatus: e.status ?? null,
+          error: e.message,
+          promptTokens: null,
+          outputTokens: null,
+          durationMs: Date.now() - started,
+        });
         if (!(err instanceof RetryableError)) throw err;
         lastError = err;
         if (attempt === 0) await sleep(1500);
@@ -59,7 +101,20 @@ async function callJson<T>(call: JsonCall): Promise<{ data: Partial<T>; model: s
   throw lastError;
 }
 
-async function callModel<T>(model: string, apiKey: string, call: JsonCall): Promise<Partial<T>> {
+// The model answered, but not with what we asked for. Keeps the raw text.
+class ResponseError extends GeminiError {
+  constructor(
+    message: string,
+    readonly text: string,
+  ) {
+    super(message, 200);
+  }
+}
+
+type Usage = { promptTokens: number | null; outputTokens: number | null };
+
+async function callModel<T>(choice: ModelChoice, apiKey: string, call: JsonCall): Promise<{ data: Partial<T>; text: string; usage: Usage }> {
+  const model = choice.apiModelId;
   const res = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
     {
@@ -69,8 +124,8 @@ async function callModel<T>(model: string, apiKey: string, call: JsonCall): Prom
         systemInstruction: { parts: [{ text: call.systemPrompt }] },
         contents: [{ role: "user", parts: call.parts }],
         generationConfig: {
-          temperature: call.temperature ?? 1,
-          maxOutputTokens: call.maxOutputTokens,
+          temperature: choice.temperature ?? call.temperature ?? 1,
+          maxOutputTokens: choice.maxOutputTokens ?? call.maxOutputTokens,
           responseMimeType: "application/json",
           responseSchema: call.schema,
           thinkingConfig: thinkingConfig(model),
@@ -93,28 +148,34 @@ async function callModel<T>(model: string, apiKey: string, call: JsonCall): Prom
       throw new RetryableError(
         res.status === 429
           ? "The AI is busy right now (rate limit). Try again in a minute."
-          : "Google's AI is overloaded right now. Try again in a minute.",
+          : res.status === 404
+            ? `Model ${model} isn't available.`
+            : "Google's AI is overloaded right now. Try again in a minute.",
+        res.status,
       );
     }
     console.error("gemini error", res.status, body.slice(0, 500));
-    throw new GeminiError(`The AI request failed (${res.status}).`);
+    throw new GeminiError(`The AI request failed (${res.status}).`, res.status);
   }
 
   const data = (await res.json()) as {
     candidates?: { content?: { parts?: { text?: string }[] }; finishReason?: string }[];
     promptFeedback?: { blockReason?: string };
+    usageMetadata?: { promptTokenCount?: number; candidatesTokenCount?: number };
   };
   if (data.promptFeedback?.blockReason || data.candidates?.[0]?.finishReason === "SAFETY") {
-    throw new GeminiError("The AI declined that one. Try something else.");
+    throw new GeminiError("The AI declined that one. Try something else.", 200);
   }
   const candidate = data.candidates?.[0];
   const text = candidate?.content?.parts?.map((p) => p.text ?? "").join("") ?? "";
-  if (!text) throw new GeminiError("The AI returned nothing. Try again.");
+  if (!text) throw new GeminiError("The AI returned nothing. Try again.", 200);
+  const usage = { promptTokens: data.usageMetadata?.promptTokenCount ?? null, outputTokens: data.usageMetadata?.candidatesTokenCount ?? null };
   try {
-    return JSON.parse(text) as Partial<T>;
+    return { data: JSON.parse(text) as Partial<T>, text, usage };
   } catch {
-    throw new GeminiError(
+    throw new ResponseError(
       candidate?.finishReason === "MAX_TOKENS" ? "The answer came out too long. Try something simpler." : "The AI returned something unexpected. Try again.",
+      text,
     );
   }
 }
@@ -145,6 +206,38 @@ Rules:
 
 export type GeneratedCaption = { style: string; text: string };
 
+export const CAPTIONS_SCHEMA = {
+  type: "OBJECT",
+  properties: {
+    captions: {
+      type: "ARRAY",
+      items: {
+        type: "OBJECT",
+        properties: { style: { type: "STRING" }, text: { type: "STRING" } },
+        required: ["style", "text"],
+        propertyOrdering: ["style", "text"],
+      },
+    },
+  },
+  required: ["captions"],
+};
+
+// Keep only the voices we asked for, one each, in our order.
+export function pickCaptions(data: Partial<{ captions: GeneratedCaption[] }>): GeneratedCaption[] {
+  const byStyle = new Map(
+    (Array.isArray(data.captions) ? data.captions : [])
+      .filter((c) => c && typeof c.text === "string" && c.text.trim())
+      .map((c) => [String(c.style).toLowerCase().trim(), c.text.trim().replace(/^["“]|["”]$/g, "").slice(0, 280)]),
+  );
+  const captions = CAPTION_STYLES.flatMap(({ style }) => {
+    const text = byStyle.get(style.toLowerCase());
+    return text ? [{ style, text }] : [];
+  });
+  if (captions.length < 2) throw new GeminiError("The AI couldn't caption that photo. Try another one.");
+  return captions;
+}
+
+// The built-in single prompt, used when the database's chains can't be loaded.
 export async function captionPhoto(
   image: { mimeType: string; base64: string },
   context: string | null,
@@ -157,33 +250,7 @@ export async function captionPhoto(
     ],
     maxOutputTokens: 2000,
     timeoutMs: 60_000,
-    schema: {
-      type: "OBJECT",
-      properties: {
-        captions: {
-          type: "ARRAY",
-          items: {
-            type: "OBJECT",
-            properties: { style: { type: "STRING" }, text: { type: "STRING" } },
-            required: ["style", "text"],
-            propertyOrdering: ["style", "text"],
-          },
-        },
-      },
-      required: ["captions"],
-    },
+    schema: CAPTIONS_SCHEMA,
   });
-
-  // Keep only the voices we asked for, one each, in our order.
-  const byStyle = new Map(
-    (Array.isArray(data.captions) ? data.captions : [])
-      .filter((c) => c && typeof c.text === "string" && c.text.trim())
-      .map((c) => [String(c.style).toLowerCase().trim(), c.text.trim().replace(/^["“]|["”]$/g, "").slice(0, 280)]),
-  );
-  const captions = CAPTION_STYLES.flatMap(({ style }) => {
-    const text = byStyle.get(style.toLowerCase());
-    return text ? [{ style, text }] : [];
-  });
-  if (captions.length < 2) throw new GeminiError("The AI couldn't caption that photo. Try another one.");
-  return { captions, model };
+  return { captions: pickCaptions(data), model };
 }

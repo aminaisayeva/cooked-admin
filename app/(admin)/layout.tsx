@@ -6,9 +6,8 @@ export default async function AdminLayout({ children }: LayoutProps<"/">) {
   return (
     <div className="min-h-screen">
       <header className="sticky top-0 z-10 border-b border-line bg-surface/90 backdrop-blur">
-        <div className="mx-auto flex max-w-6xl flex-wrap items-center gap-x-6 gap-y-2 px-4 py-3">
+        <div className="mx-auto flex max-w-7xl items-center gap-x-6 px-4 py-3">
           <span className="font-semibold">🔥 cooked.ai <span className="text-muted font-normal">admin</span></span>
-          <Nav />
           <div className="ml-auto flex items-center gap-3 text-sm text-ink-2">
             <span className="hidden truncate sm:inline">{user.email}</span>
             <form action="/auth/signout" method="post">
@@ -16,8 +15,18 @@ export default async function AdminLayout({ children }: LayoutProps<"/">) {
             </form>
           </div>
         </div>
+        <div className="border-t border-line px-4 py-2 lg:hidden">
+          <Nav />
+        </div>
       </header>
-      <main className="mx-auto max-w-6xl px-4 py-8">{children}</main>
+      <div className="mx-auto flex max-w-7xl gap-8 px-4">
+        <aside className="hidden w-48 shrink-0 lg:block">
+          <div className="sticky top-16 py-8">
+            <Nav />
+          </div>
+        </aside>
+        <main className="min-w-0 flex-1 py-8">{children}</main>
+      </div>
     </div>
   );
 }

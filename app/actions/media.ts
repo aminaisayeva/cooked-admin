@@ -3,7 +3,8 @@
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import { MAX_CONTEXT, MAX_PHOTO_BYTES, PHOTO_BUCKET, requireAdmin } from "@/lib/admin";
-import { CAPTION_STYLES, CAPTION_SYSTEM_PROMPT, captionPhoto, GeminiError } from "@/lib/gemini";
+import { CAPTION_STYLES, GeminiError } from "@/lib/gemini";
+import { linkRequestToPhoto, runCaptionPipeline } from "@/lib/pipeline";
 
 export type FormState = { error?: string; ok?: string } | null;
 
@@ -21,8 +22,9 @@ function cleanCaption(style: string, text: string): string | null {
   return null;
 }
 
-// CREATE: upload a photo, then caption it with Gemini (the same prompt and
-// voices as the cooked.ai app) or with captions typed in by the admin.
+// CREATE: upload a photo, then caption it with a prompt chain (the same
+// pipeline, logged the same way, as the cooked.ai app) or with captions typed
+// in by the admin.
 export async function createMedia(_: FormState, form: FormData): Promise<FormState> {
   const { supabase, user } = await requireAdmin();
 
@@ -38,12 +40,14 @@ export async function createMedia(_: FormState, form: FormData): Promise<FormSta
   let captions: { style: string; text: string }[];
   let model: string;
   let systemPrompt: string;
+  let pipeline: { requestId: string; chainId: string | null } | null = null;
   if (mode === "ai") {
     try {
-      const result = await captionPhoto({ mimeType: image.type, base64: bytes.toString("base64") }, context);
+      const result = await runCaptionPipeline(supabase, { image: { mimeType: image.type, base64: bytes.toString("base64") }, context, source: "admin" });
       captions = result.captions;
       model = result.model;
-      systemPrompt = CAPTION_SYSTEM_PROMPT;
+      systemPrompt = result.systemPrompt;
+      pipeline = result;
     } catch (err) {
       console.error("captioning failed", err);
       return { error: err instanceof GeminiError ? err.message : "Couldn't caption that photo. Try again." };
@@ -66,7 +70,7 @@ export async function createMedia(_: FormState, form: FormData): Promise<FormSta
 
   const { data: photo, error: photoError } = await supabase
     .from("photos")
-    .insert({ image_path: path, prompt: context, system_prompt: systemPrompt, model })
+    .insert({ image_path: path, prompt: context, system_prompt: systemPrompt, model, chain_id: pipeline?.chainId ?? null })
     .select("id")
     .single();
   if (photoError || !photo) {
@@ -83,6 +87,7 @@ export async function createMedia(_: FormState, form: FormData): Promise<FormSta
     return { error: `Couldn't save the captions: ${captionError.message}` };
   }
 
+  if (pipeline) await linkRequestToPhoto(supabase, pipeline.requestId, photo.id);
   revalidatePath("/", "layout");
   redirect(`/media/${photo.id}?created=1`);
 }
